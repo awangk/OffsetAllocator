@@ -218,57 +218,93 @@ namespace OffsetAllocator
         
         uint32 topBinIndex = minTopBinIndex;
         uint32 leafBinIndex = Allocation::NO_SPACE;
+        uint32 nodeIndex = Node::unused;
 
         // If top bin exists, scan its leaf bin. This can fail (NO_SPACE).
         if (m_usedBinsTop & (1 << topBinIndex))
         {
             leafBinIndex = findLowestSetBitAfter(m_usedBins[topBinIndex], minLeafBinIndex);
         }
-    
+
         // If we didn't find space in top bin, we search top bin from +1
         if (leafBinIndex == Allocation::NO_SPACE)
         {
             topBinIndex = findLowestSetBitAfter(m_usedBinsTop, minTopBinIndex + 1);
-            
+
             // Out of space?
             if (topBinIndex == Allocation::NO_SPACE)
             {
-                return {.offset = Allocation::NO_SPACE, .metadata = Allocation::NO_SPACE};
-            }
+                // Fallback: Free nodes are binned by their size rounded DOWN, so bin (minBinIndex - 1)
+                // may still contain nodes that are big enough to fit this allocation, even though all
+                // bins >= minBinIndex are empty. Scan that single bin for a fitting node before giving up.
+                // This is a linear walk, but it only runs when the O(1) search would otherwise
+                // incorrectly report NO_SPACE, so the common case stays O(1).
+                uint32 fallbackBinIndex = SmallFloat::uintToFloatRoundDown(size);
+                if (fallbackBinIndex != minBinIndex) // Equal when size is exactly a bin representative: no lower candidates
+                {
+                    nodeIndex = m_binIndices[fallbackBinIndex];
+                    while ((nodeIndex != Node::unused) && (m_nodes[nodeIndex].dataSize < size))
+                    {
+                        nodeIndex = m_nodes[nodeIndex].binListNext;
+                    }
+                }
 
-            // All leaf bins here fit the alloc, since the top bin was rounded up. Start leaf search from bit 0.
-            // NOTE: This search can't fail since at least one leaf bit was set because the top bit was set.
-            leafBinIndex = tzcnt_nonzero(m_usedBins[topBinIndex]);
+                if (nodeIndex == Node::unused)
+                {
+                    return {.offset = Allocation::NO_SPACE, .metadata = Allocation::NO_SPACE};
+                }
+
+                topBinIndex = fallbackBinIndex >> TOP_BINS_INDEX_SHIFT;
+                leafBinIndex = fallbackBinIndex & LEAF_BINS_INDEX_MASK;
+            }
+            else
+            {
+                // All leaf bins here fit the alloc, since the top bin was rounded up. Start leaf search from bit 0.
+                // NOTE: This search can't fail since at least one leaf bit was set because the top bit was set.
+                leafBinIndex = tzcnt_nonzero(m_usedBins[topBinIndex]);
+            }
         }
-                
+
         uint32 binIndex = (topBinIndex << TOP_BINS_INDEX_SHIFT) | leafBinIndex;
-        
-        // Pop the top node of the bin. Bin top = node.next.
-        uint32 nodeIndex = m_binIndices[binIndex];
+
+        // Take the top node of the bin, unless the fallback scan already picked a fitting node
+        if (nodeIndex == Node::unused) nodeIndex = m_binIndices[binIndex];
         Node& node = m_nodes[nodeIndex];
         uint32 nodeTotalSize = node.dataSize;
+        ASSERT(nodeTotalSize >= size);
         node.dataSize = size;
         node.used = true;
-        m_binIndices[binIndex] = node.binListNext;
-        if (node.binListNext != Node::unused) m_nodes[node.binListNext].binListPrev = Node::unused;
+        if (node.binListPrev != Node::unused)
+        {
+            // Not the bin top (picked by the fallback scan): unlink from the middle of the list.
+            // Bin can't get empty, so the bin mask bits stay set.
+            m_nodes[node.binListPrev].binListNext = node.binListNext;
+            if (node.binListNext != Node::unused) m_nodes[node.binListNext].binListPrev = node.binListPrev;
+        }
+        else
+        {
+            // Pop the top node of the bin. Bin top = node.next.
+            m_binIndices[binIndex] = node.binListNext;
+            if (node.binListNext != Node::unused) m_nodes[node.binListNext].binListPrev = Node::unused;
+
+            // Bin empty?
+            if (m_binIndices[binIndex] == Node::unused)
+            {
+                // Remove a leaf bin mask bit
+                m_usedBins[topBinIndex] &= ~(1 << leafBinIndex);
+
+                // All leaf bins empty?
+                if (m_usedBins[topBinIndex] == 0)
+                {
+                    // Remove a top bin mask bit
+                    m_usedBinsTop &= ~(1 << topBinIndex);
+                }
+            }
+        }
         m_freeStorage -= nodeTotalSize;
 #ifdef DEBUG_VERBOSE
         printf("Free storage: %u (-%u) (allocate)\n", m_freeStorage, nodeTotalSize);
 #endif
-
-        // Bin empty?
-        if (m_binIndices[binIndex] == Node::unused)
-        {
-            // Remove a leaf bin mask bit
-            m_usedBins[topBinIndex] &= ~(1 << leafBinIndex);
-            
-            // All leaf bins empty?
-            if (m_usedBins[topBinIndex] == 0)
-            {
-                // Remove a top bin mask bit
-                m_usedBinsTop &= ~(1 << topBinIndex);
-            }
-        }
         
         // Push back reminder N elements to a lower bin
         uint32 reminderSize = nodeTotalSize - size;
@@ -356,7 +392,8 @@ namespace OffsetAllocator
 
     uint32 Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset)
     {
-        // Round down to bin index to ensure that bin >= alloc
+        // Round down to bin index to ensure that node size >= bin representative size,
+        // so that allocations (which round up) always fit the nodes of the bins they search
         uint32 binIndex = SmallFloat::uintToFloatRoundDown(size);
         
         uint32 topBinIndex = binIndex >> TOP_BINS_INDEX_SHIFT;
@@ -401,8 +438,8 @@ namespace OffsetAllocator
         else
         {
             // Hard case: We are the first node in a bin. Find the bin.
-            
-            // Round down to bin index to ensure that bin >= alloc
+
+            // Use the same mapping as insertion (round down)
             uint32 binIndex = SmallFloat::uintToFloatRoundDown(node.dataSize);
             
             uint32 topBinIndex = binIndex >> TOP_BINS_INDEX_SHIFT;

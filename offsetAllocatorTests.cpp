@@ -4,6 +4,8 @@
 
 #include "offsetAllocator.hpp"
 
+#include <cstring>
+
 using namespace f;
 
 namespace OffsetAllocator
@@ -253,6 +255,167 @@ namespace offsetAllocatorTests
 
             // End: Validate that allocator has no fragmentation left. Should be 100% clean.
             OffsetAllocator::Allocation validateAll = allocator.allocate(1024 * 1024 * 256);
+            REQUIRE(validateAll.offset == 0);
+            allocator.free(validateAll);
+        }
+    }
+
+    // Regression tests for https://github.com/sebbbi/OffsetAllocator/pull/11
+    // Free nodes are binned by size rounded DOWN, so bin (minBinIndex - 1) can contain nodes that
+    // still fit the allocation. The allocator must fall back to scanning that bin instead of
+    // returning NO_SPACE when free space exists.
+    TEST_CASE("bin fallback", "[offsetAllocator]")
+    {
+        SECTION("remainder lands in lower bin")
+        {
+            OffsetAllocator::Allocator allocator(256 + 68);
+
+            OffsetAllocator::Allocation a = allocator.allocate(255);
+            REQUIRE(a.offset == 0);
+
+            // 69 bytes left, but the free node sits in bin 32 (representative size 64),
+            // below the 67 byte request's min bin 33 (representative size 72)
+            OffsetAllocator::StorageReport report = allocator.storageReport();
+            REQUIRE(report.totalFreeSpace == 69);
+
+            OffsetAllocator::Allocation b = allocator.allocate(67);
+            REQUIRE(b.offset == 255); // Must succeed and must not overlap a
+
+            allocator.free(a);
+            allocator.free(b);
+
+            // End: Validate that allocator has no fragmentation left. Should be 100% clean.
+            OffsetAllocator::Allocation validateAll = allocator.allocate(256 + 68);
+            REQUIRE(validateAll.offset == 0);
+            allocator.free(validateAll);
+        }
+
+        SECTION("fallback bin crosses top bin boundary")
+        {
+            // roundUp(255) = bin 48 = (top 6, leaf 0), roundDown(255) = bin 47 = (top 5, leaf 7):
+            // the fallback bin is the last leaf of the PREVIOUS top bin
+            OffsetAllocator::Allocator allocator(255);
+
+            OffsetAllocator::Allocation a = allocator.allocate(255);
+            REQUIRE(a.offset == 0);
+            REQUIRE(allocator.storageReport().totalFreeSpace == 0);
+
+            allocator.free(a);
+            REQUIRE(allocator.storageReport().totalFreeSpace == 255);
+        }
+
+        SECTION("fallback scan skips too small nodes")
+        {
+            // Layout: [a:64][b:1][c:69][d:1] = 135. Bin 32 covers sizes 64..71.
+            OffsetAllocator::Allocator allocator(135);
+
+            OffsetAllocator::Allocation a = allocator.allocate(64);
+            REQUIRE(a.offset == 0);
+            OffsetAllocator::Allocation b = allocator.allocate(1);
+            REQUIRE(b.offset == 64);
+            OffsetAllocator::Allocation c = allocator.allocate(69); // Needs the fallback itself
+            REQUIRE(c.offset == 65);
+            OffsetAllocator::Allocation d = allocator.allocate(1);
+            REQUIRE(d.offset == 134);
+            REQUIRE(allocator.storageReport().totalFreeSpace == 0);
+
+            // Free order puts the too small 64 node at the head of bin 32: list = [64 @0, 69 @65]
+            allocator.free(c);
+            allocator.free(a);
+
+            // 67 doesn't fit the 64 head node: fallback must walk past it and take the 69 node
+            OffsetAllocator::Allocation e = allocator.allocate(67);
+            REQUIRE(e.offset == 65);
+
+            allocator.free(e);
+            allocator.free(b);
+            allocator.free(d);
+
+            // End: Validate that allocator has no fragmentation left. Should be 100% clean.
+            OffsetAllocator::Allocation validateAll = allocator.allocate(135);
+            REQUIRE(validateAll.offset == 0);
+            allocator.free(validateAll);
+        }
+
+        SECTION("stress no overlap")
+        {
+            // Deterministic pseudo-random alloc/free churn with byte exact overlap validation.
+            // Guards against fixes that hand out too small nodes (overlapping allocations),
+            // like the reverted round-up-on-insert attempt in PR #11.
+            static constexpr uint32 poolSize = 4096;
+            static constexpr uint32 maxLive = 1024;
+
+            OffsetAllocator::Allocator allocator(poolSize, maxLive);
+
+            static bool inUse[poolSize];
+            memset(inUse, 0, sizeof(inUse));
+
+            struct Entry
+            {
+                OffsetAllocator::Allocation allocation;
+                uint32 size;
+            };
+            static Entry live[maxLive];
+            uint32 liveCount = 0;
+            uint32 liveBytes = 0;
+
+            uint32 rngState = 12345;
+            auto nextRand = [&rngState]() { rngState = rngState * 1664525u + 1013904223u; return rngState >> 16; };
+
+            for (uint32 iteration = 0; iteration < 4096; iteration++)
+            {
+                bool doAllocate = (liveCount == 0) || ((liveCount < maxLive - 1) && ((nextRand() % 100) < 55));
+                if (doAllocate)
+                {
+                    uint32 size = 1 + (nextRand() % 256);
+                    OffsetAllocator::Allocation allocation = allocator.allocate(size);
+                    if (allocation.offset != OffsetAllocator::Allocation::NO_SPACE)
+                    {
+                        REQUIRE(allocation.offset + size <= poolSize);
+                        bool overlap = false;
+                        for (uint32 i = 0; i < size; i++)
+                        {
+                            overlap |= inUse[allocation.offset + i];
+                            inUse[allocation.offset + i] = true;
+                        }
+                        REQUIRE(overlap == false);
+                        REQUIRE(allocator.allocationSize(allocation) == size);
+                        live[liveCount++] = {.allocation = allocation, .size = size};
+                        liveBytes += size;
+                    }
+                    else
+                    {
+                        // NO_SPACE with less than the pool allocated must never happen for a
+                        // request that provably fits in the worst free region: just require
+                        // that a request matching the reported largest free region succeeds.
+                        OffsetAllocator::StorageReport report = allocator.storageReport();
+                        REQUIRE(size > report.largestFreeRegion);
+                    }
+                }
+                else
+                {
+                    uint32 index = nextRand() % liveCount;
+                    Entry entry = live[index];
+                    bool wasInUse = true;
+                    for (uint32 i = 0; i < entry.size; i++)
+                    {
+                        wasInUse &= inUse[entry.allocation.offset + i];
+                        inUse[entry.allocation.offset + i] = false;
+                    }
+                    REQUIRE(wasInUse == true);
+                    allocator.free(entry.allocation);
+                    liveBytes -= entry.size;
+                    live[index] = live[--liveCount];
+                }
+
+                REQUIRE(allocator.storageReport().totalFreeSpace == poolSize - liveBytes);
+            }
+
+            // Cleanup and validate that the full pool is allocatable again
+            for (uint32 i = 0; i < liveCount; i++)
+                allocator.free(live[i].allocation);
+
+            OffsetAllocator::Allocation validateAll = allocator.allocate(poolSize);
             REQUIRE(validateAll.offset == 0);
             allocator.free(validateAll);
         }
